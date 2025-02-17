@@ -393,7 +393,7 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
               case _           => None
 
           val cachedDest = value(buildNative(
-            build = build,
+            builds = Seq(build),
             mainClass = mainClassO,
             targetType = tpe,
             destPath = Some(destPath),
@@ -535,10 +535,10 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
     val dest    = workDir / "doc.jar"
     val cacheData =
       CachedBinary.getCacheData(
-        build,
-        extraArgs.toList,
-        dest,
-        workDir
+        builds = Seq(build),
+        config = extraArgs.toList,
+        dest = dest,
+        workDir = workDir
       )
 
     if (cacheData.changed) {
@@ -667,7 +667,7 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
       case Platform.Native =>
         val dest =
           value(buildNative(
-            build = build,
+            builds = Seq(build),
             mainClass = Some(mainClass),
             targetType = PackageType.Native.Application,
             destPath = None,
@@ -697,7 +697,7 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
     isFullOpt <- build.options.scalaJsOptions.fullOpt
     linkerConfig = build.options.scalaJsOptions.linkerConfig(logger)
     linkResult <- linkJs(
-      build,
+      Seq(build),
       destPath,
       mainClass,
       addTestInitializer = false,
@@ -947,7 +947,7 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
   }
 
   def linkJs(
-    build: Build.Successful,
+    builds: Seq[Build.Successful],
     dest: os.Path,
     mainClassOpt: Option[String],
     addTestInitializer: Boolean,
@@ -957,19 +957,19 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
     logger: Logger,
     scratchDirOpt: Option[os.Path] = None
   ): Either[BuildException, os.Path] = {
-    val mainJar   = Library.libraryJar(build)
-    val classPath = mainJar +: build.artifacts.classPath
+    val jars      = builds.map(Library.libraryJar(_))
+    val classPath = jars ++ builds.flatMap(_.artifacts.classPath)
     val input = ScalaJsLinker.LinkJSInput(
-      options = build.options.notForBloopOptions.scalaJsLinkerOptions,
+      options = builds.head.options.notForBloopOptions.scalaJsLinkerOptions,
       javaCommand =
-        build.options.javaHome().value.javaCommand, // FIXME Allow users to use another JVM here?
+        builds.head.options.javaHome().value.javaCommand, // FIXME Allow users to use another JVM here?
       classPath = classPath,
       mainClassOrNull = mainClassOpt.orNull,
       addTestInitializer = addTestInitializer,
       config = config,
       fullOpt = fullOpt,
       noOpt = noOpt,
-      scalaJsVersion = build.options.scalaJsOptions.finalVersion
+      scalaJsVersion = builds.head.options.scalaJsOptions.finalVersion
     )
 
     val linkingDir = LinkingDir.getOrCreate(input, scratchDirOpt)
@@ -980,8 +980,8 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
           input,
           linkingDir,
           logger,
-          build.options.finalCache,
-          build.options.archiveCache
+          builds.head.options.finalCache,
+          builds.head.options.archiveCache
         )
       }
       val relMainJs      = os.rel / "main.js"
@@ -1012,9 +1012,9 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
         }
         else {
           os.copy(mainJs, dest, replaceExisting = true)
-          if (build.options.scalaJsOptions.emitSourceMaps && os.exists(sourceMapJs)) {
+          if (builds.head.options.scalaJsOptions.emitSourceMaps && os.exists(sourceMapJs)) {
             val sourceMapDest =
-              build.options.scalaJsOptions.sourceMapsDest.getOrElse(os.Path(s"$dest.map"))
+              builds.head.options.scalaJsOptions.sourceMapsDest.getOrElse(os.Path(s"$dest.map"))
             val updatedMainJs = ScalaJsLinker.updateSourceMappingURL(dest)
             os.write.over(dest, updatedMainJs)
             os.copy(sourceMapJs, sourceMapDest, replaceExisting = true)
@@ -1031,28 +1031,29 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
   }
 
   def buildNative(
-    build: Build.Successful,
+    builds: Seq[Build.Successful],
     mainClass: Option[String], // when building a static/dynamic library, we don't need a main class
     targetType: PackageType.Native,
     destPath: Option[os.Path],
     logger: Logger
   ): Either[BuildException, os.Path] = either {
-    val dest = build.inputs.nativeWorkDir / s"main${if (Properties.isWin) ".exe" else ""}"
+    val dest = builds.head.inputs.nativeWorkDir / s"main${if (Properties.isWin) ".exe" else ""}"
 
     val cliOptions =
-      build.options.scalaNativeOptions.configCliOptions(build.sources.resourceDirs.nonEmpty)
+      builds.head.options.scalaNativeOptions.configCliOptions(builds.exists(
+        _.sources.resourceDirs.nonEmpty
+      ))
 
-    val setupPython = build.options.notForBloopOptions.doSetupPython.getOrElse(false)
+    val setupPython = builds.head.options.notForBloopOptions.doSetupPython.getOrElse(false)
     val pythonLdFlags =
-      if (setupPython)
+      if setupPython then
         value {
           val python       = Python()
           val flagsOrError = python.ldflags
           logger.debug(s"Python ldflags: $flagsOrError")
           flagsOrError.orPythonDetectionError
         }
-      else
-        Nil
+      else Nil
     val pythonCliOptions = pythonLdFlags.flatMap(f => Seq("--linking-option", f)).toList
 
     val libraryLinkingOptions: Seq[String] =
@@ -1076,21 +1077,21 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
       libraryLinkingOptions ++
       mainClass.toSeq.flatMap(m => Seq("--main", m))
 
-    val nativeWorkDir = build.inputs.nativeWorkDir
+    val nativeWorkDir = builds.head.inputs.nativeWorkDir
     os.makeDir.all(nativeWorkDir)
 
     val cacheData =
       CachedBinary.getCacheData(
-        build,
+        builds,
         allCliOptions,
         dest,
         nativeWorkDir
       )
 
     if (cacheData.changed) {
-      NativeResourceMapper.copyCFilesToScalaNativeDir(build, nativeWorkDir)
-      val mainJar   = Library.libraryJar(build)
-      val classpath = mainJar.toString +: build.artifacts.classPath.map(_.toString)
+      builds.foreach(build => NativeResourceMapper.copyCFilesToScalaNativeDir(build, nativeWorkDir))
+      val jars      = builds.map(Library.libraryJar(_))
+      val classpath = (jars ++ builds.flatMap(_.artifacts.classPath)).map(_.toString).distinct
       val args =
         allCliOptions ++
           logger.scalaNativeCliInternalLoggerOptions ++
@@ -1101,7 +1102,7 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
             nativeWorkDir.toString()
           ) ++ classpath
 
-      val scalaNativeCli = build.artifacts.scalaOpt
+      val scalaNativeCli = builds.flatMap(_.artifacts.scalaOpt).headOption
         .getOrElse {
           sys.error("Expected Scala artifacts to be fetched")
         }
@@ -1109,17 +1110,16 @@ object Package extends ScalaCommand[PackageOptions] with BuildCommandHelpers {
 
       val exitCode =
         Runner.runJvm(
-          build.options.javaHome().value.javaCommand,
-          build.options.javaOptions.javaOpts.toSeq.map(_.value.value),
+          builds.head.options.javaHome().value.javaCommand,
+          builds.head.options.javaOptions.javaOpts.toSeq.map(_.value.value),
           scalaNativeCli,
           "scala.scalanative.cli.ScalaNativeLd",
           args,
           logger
         ).waitFor()
-      if (exitCode == 0)
+      if exitCode == 0 then
         CachedBinary.updateProjectAndOutputSha(dest, nativeWorkDir, cacheData.projectSha)
-      else
-        throw new ScalaNativeBuildError
+      else throw new ScalaNativeBuildError
     }
 
     dest

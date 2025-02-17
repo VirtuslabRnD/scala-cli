@@ -2362,4 +2362,22 @@ abstract class RunTestDefinitions
       }
 
     }
+
+  for (
+    (platformDescription, platformOpts) <- Seq(
+      "JVM"    -> Seq(),
+      "JS"     -> Seq("--js"),
+      "Native" -> Seq("--native")
+    )
+  )
+    test(s"run a main method from the test scope ($platformDescription)") {
+      val expectedMessage = "Hello from the test scope"
+      TestInputs(
+        os.rel / "example.test.scala" -> s"""object Main extends App { println("$expectedMessage") }"""
+      ).fromRoot { root =>
+        val res = os.proc(TestUtil.cli, "run", ".", "--test", extraOptions, platformOpts)
+          .call(cwd = root)
+        expect(res.out.trim().contains(expectedMessage))
+      }
+    }
 }
